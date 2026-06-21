@@ -1,14 +1,11 @@
-import zlib
+from lxml import etree
 from io import BytesIO
+from typing import Union
+from . import utils, verify
+import os, base64, zlib, zipfile
+
 from PIL import Image, ImageFile
 ImageFile.LOAD_TRUNCATED_IMAGES = True
-import xml.etree.ElementTree as ET
-from io import BytesIO
-import base64
-import zipfile
-from typing import Union
-from . import utils
-from . import verify
 
 class AadhaarSecureQr:
     # This is the class for Aadhaar Secure Qr code..  In this version of code the data is in encrypted format
@@ -261,8 +258,10 @@ class AadhaarOldQr:
 
     def __init__(self, qrdata) -> None:
         self.qrdata = qrdata
-        self.xmlparser = ET.XMLParser(encoding="utf-8")
-        self.parsedxml = ET.fromstring(qrdata, parser=self.xmlparser)
+        try:
+            self.parsedxml = etree.fromstring(qrdata.encode("utf-8"))
+        except etree.XMLSyntaxError as e:
+            raise ValueError("Invalid QR XML") from e
         self.data = self.parsedxml.attrib
 
     def decodeddata(self) -> dict:
@@ -274,61 +273,95 @@ class AadhaarOfflineXML:
 
     # This is the class for Aadhaar Offline XML
     # The special thing of Offline XML is that we can extract the high quality photo of user from the data
-    # For more information check here : https://103.57.226.101/images/resource/User_manulal_QR_Code_15032019.pdf
+    # For more information check here : https://uidai.gov.in/en/ecosystem/authentication-devices-documents/about-aadhaar-paperless-offline-e-kyc.html
 
     def __init__(self, file:str, passcode:str) -> None:
-        # Need to pass the zip file and passcode/sharecode to this function
         self.passcode = passcode
         self.data = {}
-        zf = zipfile.ZipFile(file, 'r')
-        zf.setpassword(str(self.passcode).encode('utf-8'))
-        filedata = zf.open(zf.namelist()[0]).read()
-        parsedxml = ET.fromstring(
-            filedata, parser=ET.XMLParser(encoding="utf-8"))
-        self.root = parsedxml
 
-        self.hashofmobile = self.root[0][0].attrib['m']
-        self.hashofemail = self.root[0][0].attrib['e']
+        # Extracting raw xml bytes from the file (supports both .xml and password-protected .zip containing .xml)
+        extension = os.path.splitext(file)[1].lower()
+        if ".zip" == extension:
+            # Need to pass the zip file and passcode/sharecode to this function
+            if not passcode:
+                raise ValueError("passcode is required when verifying a zipped offline XML")
+            try:
+                with zipfile.ZipFile(file, "r") as zf:
+                    xml_names = [name for name in zf.namelist() if name.lower().endswith(".xml")]
+                    if not xml_names:
+                        raise ValueError("ZIP archive does not contain an XML file")
+                    zf.setpassword(str(passcode).encode("utf-8"))
+                    filedata = zf.read(xml_names[0])
+            except RuntimeError as e:
+                raise ValueError("Could not open ZIP archive. The share code/passcode may be incorrect.") from e
+            except zipfile.BadZipFile as e:
+                raise ValueError("Unsupported or corrupted ZIP archive") from e
+            
+        elif ".xml" == extension:
+            with open(file, "rb") as f:
+                filedata = f.read()
 
-        if self.hashofmobile != "" and self.hashofemail != "":
-            self.data['email_mobile_status'] = "3"
-        elif self.hashofmobile == "" and self.hashofemail != "":
-            self.data['email_mobile_status'] = "2"
-        elif self.hashofmobile != "" and self.hashofemail == "":
-            self.data['email_mobile_status'] = "1"
-        elif self.hashofmobile == "" and self.hashofemail == "":
-            self.data['email_mobile_status'] = "0"
+        else:
+            raise ValueError("Unsupported offline eKYC file type. Provide a .xml file or a password-protected .zip file.")
 
-        self.data['referenceid'] = self.root.attrib['referenceId']
-        self.data['name'] = self.root[0][0].attrib['name']
-        self.data['dob'] = self.root[0][0].attrib['dob']
-        self.data['gender'] = self.root[0][0].attrib['gender']
-        self.data['careof'] = self.root[0][1].attrib['careof']
-        self.data['district'] = self.root[0][1].attrib['dist']
-        self.data['landmark'] = self.root[0][1].attrib['landmark']
-        self.data['house'] = self.root[0][1].attrib['house']
-        self.data['location'] = self.root[0][1].attrib['loc']
-        self.data['pincode'] = self.root[0][1].attrib['pc']
-        self.data['postoffice'] = self.root[0][1].attrib['po']
-        self.data['state'] = self.root[0][1].attrib['state']
-        self.data['street'] = self.root[0][1].attrib['street']
-        self.data['subdistrict'] = self.root[0][1].attrib['subdist']
-        self.data['vtc'] = self.root[0][1].attrib['vtc']
-        self.data['aadhaar_last_4_digit'] = self.data['referenceid'][0:4]
-        self.data['aadhaar_last_digit'] = self.data['referenceid'][3]
+        # Parse the XML data
+        try:
+            self.root = etree.fromstring(filedata)
+        except etree.XMLSyntaxError as e:
+            raise ValueError("Invalid XML file") from e
+        if self.root.tag != "OfflinePaperlessKyc":
+            raise ValueError("Not an Aadhaar OfflinePaperlessKyc XML document")
+        
+        uid_data = self.root.find(".//UidData")
+        self.data = self._build_data(uid_data)
 
-        if self.data['email_mobile_status'] == "0":
-            self.data['email'] = False
-            self.data['mobile'] = False
-        elif self.data['email_mobile_status'] == "1":
-            self.data['email'] = True
-            self.data['mobile'] = False
-        elif self.data['email_mobile_status'] == "2":
-            self.data['email'] = False
-            self.data['mobile'] = True
-        elif self.data['email_mobile_status'] == "3":
-            self.data['email'] = True
-            self.data['mobile'] = True
+
+    # Extract data from uid data within XML
+    def _build_data(self, uid_data):
+        if uid_data is None:
+            raise ValueError("Offline eKYC XML is missing UidData")
+        poi = uid_data.find("Poi")
+        poa = uid_data.find("Poa")
+        photo = uid_data.find("Pht")
+        if poi is None or poa is None or photo is None:
+            raise ValueError("Offline eKYC XML is missing Poi, Poa, or Pht data")
+        reference_id = self.root.get("referenceId", "")
+        mobile_hash = poi.get("m", "")
+        email_hash = poi.get("e", "")
+
+        data = {
+            "referenceid": reference_id,
+            "name": poi.get("name", ""),
+            "dob": poi.get("dob", ""),
+            "gender": poi.get("gender", ""),
+            "careof": poa.get("careof", ""),
+            "district": poa.get("dist", ""),
+            "landmark": poa.get("landmark", ""),
+            "house": poa.get("house", ""),
+            "location": poa.get("loc", ""),
+            "pincode": poa.get("pc", ""),
+            "postoffice": poa.get("po", ""),
+            "state": poa.get("state", ""),
+            "street": poa.get("street", ""),
+            "subdistrict": poa.get("subdist", ""),
+            "vtc": poa.get("vtc", ""),
+            "photo": photo.text or "",
+            "mobile_hash": mobile_hash,
+            "email_hash": email_hash,
+            "aadhaar_last_4_digit": reference_id[:4],
+            "aadhaar_last_digit": reference_id[3] if len(reference_id) > 3 else "",
+            "mobile": bool(mobile_hash),
+            "email": bool(email_hash),
+        }
+        if data["mobile"] and data["email"]:
+            data["email_mobile_status"] = "3"
+        elif data["mobile"]:
+            data["email_mobile_status"] = "1"
+        elif data["email"]:
+            data["email_mobile_status"] = "2"
+        else:
+            data["email_mobile_status"] = "0"
+        return data
 
     # Get decoded data in dictionary format
     def decodeddata(self) -> dict:
@@ -336,60 +369,39 @@ class AadhaarOfflineXML:
 
     # Fetch signature
     def signature(self) -> str:
-        return self.root[1][1].text
+        signature_nodes = self.root.xpath("//*[local-name()='SignatureValue']/text()")
+        return signature_nodes[0] if signature_nodes else ""
 
     # Check if mobile number is registered
     def isMobileNoRegistered(self) -> bool:
-        # Will return True if mobile number is registered
-        if int(self.data['email_mobile_status']) == 3 or int(self.data['email_mobile_status']) == 1:
-            return True
-        return False
+        return self.data["mobile"]
 
     # Check if email id is registered
     def isEmailRegistered(self) -> bool:
-        # Will return True if email id is registered
-        if int(self.data['email_mobile_status']) == 3 or int(self.data['email_mobile_status']) == 2:
-            return True
-        return False
+        return self.data["email"]
 
     # Get the hash of email id
     def sha256hashOfEMail(self) -> str:
-        # Will return the hash of the email id
-        return self.hashofemail
+        return self.data["email_hash"]
 
     # Get the hash of mobile number
     def sha256hashOfMobileNumber(self) -> str:
-        # Will return the hash of mobile number
-        return self.hashofmobile
+        return self.data["mobile_hash"]
 
     # Get the image of user
     def image(self) -> Image.Image:
-        # Will return the image stream to be used in another function
-        img = self.root[0][2].text
-        img = Image.open(BytesIO(base64.b64decode(img)))
-        return img
+        return Image.open(BytesIO(base64.b64decode(self.data["photo"])))
 
     # Save the image of user
     def saveimage(self, filepath:str) -> None:
-        # Will save the image of user
-        image = self.image()
-        image.save(filepath)
+        self.image().save(filepath)
 
     # Verify the email id
     def verifyEmail(self, emailid:str) -> bool:
-        # Will return True if emailid match with the given email id
-        generated_sha_mail = utils.SHAGenerator(
-            str(emailid)+str(self.passcode), self.data['aadhaar_last_digit'])
-        if generated_sha_mail == self.sha256hashOfEMail():
-            return True
-        else:
-            return False
+        generated_sha_mail = utils.SHAGenerator(str(emailid)+str(self.passcode), self.data['aadhaar_last_digit'])
+        return generated_sha_mail == self.sha256hashOfEMail()
 
     # Verify the mobile number
     def verifyMobileNumber(self, mobileno:str) -> bool:
-        # Will return True if mobileno match with the given mobile no
         generated_sha_mobile = utils.SHAGenerator(str(mobileno)+str(self.passcode), self.data['aadhaar_last_digit'])
-        if generated_sha_mobile == self.sha256hashOfMobileNumber():
-            return True
-        else:
-            return False
+        return generated_sha_mobile == self.sha256hashOfMobileNumber()
