@@ -8,3 +8,5 @@ pytz
 pyzbar
 six
 toml
+lxml
+cryptography

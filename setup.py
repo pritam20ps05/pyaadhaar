@@ -33,7 +33,9 @@ setup(
         'pytz',
         'pyzbar',
         'six',
-        'toml'
+        'toml',
+        'lxml',
+        'cryptography',
     ],
 
 )

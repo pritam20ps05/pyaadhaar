@@ -25,6 +25,8 @@ Requires-Dist: pytz
 Requires-Dist: pyzbar
 Requires-Dist: six
 Requires-Dist: toml
+Requires-Dist: lxml
+Requires-Dist: cryptography
 Dynamic: author
 Dynamic: author-email
 Dynamic: classifier

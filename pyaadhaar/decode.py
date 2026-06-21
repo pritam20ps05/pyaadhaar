@@ -8,6 +8,7 @@ import base64
 import zipfile
 from typing import Union
 from . import utils
+from . import verify
 
 class AadhaarSecureQr:
     # This is the class for Aadhaar Secure Qr code..  In this version of code the data is in encrypted format
@@ -210,6 +211,19 @@ class AadhaarSecureQr:
         image = self.image()
         image.load()
         image.save(filepath)
+
+    # Verify the signature of the QR code
+    def verifySignature(self, cert_path: str) -> bool:
+        """_Verify QR code signature_
+
+        Args:
+            cert_path (str): _Path to the certificate file issued by UIDAI_
+
+        Returns:
+            bool: _True if the signature is valid, False otherwise_
+        """
+        public_key = verify.getPKfromCert(cert_path)
+        return verify.verifyBypk(self.signedData(), self.signature(), public_key)
 
     # Verify the email id
     def verifyEmail(self, emailid:str) -> bool:
