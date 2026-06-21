@@ -276,6 +276,7 @@ class AadhaarOfflineXML:
     # For more information check here : https://uidai.gov.in/en/ecosystem/authentication-devices-documents/about-aadhaar-paperless-offline-e-kyc.html
 
     def __init__(self, file:str, passcode:str) -> None:
+        self.XMLDSIG_NS = "http://www.w3.org/2000/09/xmldsig#"
         self.passcode = passcode
         self.data = {}
 
@@ -315,6 +316,8 @@ class AadhaarOfflineXML:
         uid_data = self.root.find(".//UidData")
         self.data = self._build_data(uid_data)
 
+        # Run XML format validation and extract metadata
+        self._xml_format_validation()
 
     # Extract data from uid data within XML
     def _build_data(self, uid_data):
@@ -362,15 +365,47 @@ class AadhaarOfflineXML:
         else:
             data["email_mobile_status"] = "0"
         return data
+    
+    # Validates XML and extracts metadata
+    def _xml_format_validation(self, strict: bool = False) -> None:
+        signature_element = self.root.find(f".//{{{self.XMLDSIG_NS}}}Signature")
+        if signature_element is None:
+            raise ValueError("No XML signature element found")
+        
+        signed_info = signature_element.find(f"{{{self.XMLDSIG_NS}}}SignedInfo")
+        if signed_info is None:
+            raise ValueError("Invalid XML signature block")
+        
+        if strict:
+            signature_method = signed_info.find(f"{{{self.XMLDSIG_NS}}}SignatureMethod")
+            signature_algorithm = signature_method.get("Algorithm", "") if signature_method is not None else ""
+            if signature_algorithm != f"{{{self.XMLDSIG_NS}}}rsa-sha1":
+                raise ValueError(f"Unsupported XML signature algorithm: {signature_algorithm or 'undefined'}")
+            
+            canonicalization_method = signed_info.find(f"{{{self.XMLDSIG_NS}}}CanonicalizationMethod")
+            canonicalization_algorithm = canonicalization_method.get("Algorithm", "") if canonicalization_method is not None else ""
+            if canonicalization_algorithm != "http://www.w3.org/TR/2001/REC-xml-c14n-20010315":
+                raise ValueError(f"Unsupported XML canonicalization algorithm: {canonicalization_algorithm or 'undefined'}")
+        
+        self.signature_value = signature_element.findtext(f"{{{self.XMLDSIG_NS}}}SignatureValue")
+        self.signed_data = etree.tostring(
+            signed_info,
+            method="c14n",
+            exclusive=True,
+            with_comments=False,
+        )
 
     # Get decoded data in dictionary format
     def decodeddata(self) -> dict:
         return self.data
 
-    # Fetch signature
+    # Returns signature
     def signature(self) -> str:
-        signature_nodes = self.root.xpath("//*[local-name()='SignatureValue']/text()")
-        return signature_nodes[0] if signature_nodes else ""
+        return self.signature_value if self.signature_value else ""
+    
+    # Returns signed data
+    def signedData(self) -> bytes:
+        return self.signed_data if self.signed_data else b""
 
     # Check if mobile number is registered
     def isMobileNoRegistered(self) -> bool:
