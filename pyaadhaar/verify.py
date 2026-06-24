@@ -1,12 +1,14 @@
+import base64
 import os
 from cryptography import x509
 from cryptography.hazmat.backends import default_backend 
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, types
+from . import utils
 
 # Basic functions for Cryptographic verification
 
-def verifyBypk(data: bytes, signature: bytes, public_key: types.PublicKeyTypes) -> bool:
+def verifyBypk(data: bytes, signature: bytes, public_key: types.PublicKeyTypes, hash: int = 0) -> bool:
     """
     Verifies the signature of the Aadhaar QR code against the provided public key. 
     Using SHA256 as the hashing algorithm and PKCS1v15 padding.
@@ -14,6 +16,7 @@ def verifyBypk(data: bytes, signature: bytes, public_key: types.PublicKeyTypes) 
     - Data: The signed data extracted from the QR code.
     - Signature: The signature extracted from the QR code.
     - Public Key: The public key for verification.
+    - Hash: The hashing algorithm to use. 0 for SHA256 (default), 1 for SHA1.
 
     Returns True if the signature is valid, False otherwise.
     """
@@ -31,19 +34,32 @@ def verifyBypk(data: bytes, signature: bytes, public_key: types.PublicKeyTypes) 
             signature,
             data,
             padding.PKCS1v15(),
-            hashes.SHA256()
+            (hashes.SHA256(), hashes.SHA1())[hash]
         )
         return True
     except Exception:
         return False
     
-def getPKfromCert(cert_path: str) -> types.CertificatePublicKeyTypes:
+def extract_embedded_x509_certificate(root) -> x509.Certificate | None:
+    cert_nodes = root.xpath("//*[local-name()='X509Certificate']/text()")
+    if not cert_nodes:
+        return None
+
+    cert_text = utils._clean_base64_text(cert_nodes[0])
+    if not cert_text:
+        return None
+
+    cert_der = base64.b64decode(cert_text)
+    return x509.load_der_x509_certificate(cert_der, default_backend())
+    
+    
+def getCertfromFile(cert_path: str) -> x509.Certificate:
     """
-    Extracts the public key from a given certificate file.
+    Extracts the certificate from a given certificate file.
 
     - cert_path: Path to the certificate file (in PEM or DER format).
 
-    Returns the public key extracted from the certificate.
+    Returns the certificate extracted from the file.
     """
     if not os.path.exists(cert_path):
         raise FileNotFoundError(f"Certificate file not found: {cert_path}")
@@ -52,12 +68,12 @@ def getPKfromCert(cert_path: str) -> types.CertificatePublicKeyTypes:
         cert_data = cert_file.read()
         try:
             # Load the certificate
-            cert = x509.load_pem_x509_certificate(cert_data, default_backend())
-        except ValueError:
-            # If PEM loading fails, try DER
             cert = x509.load_der_x509_certificate(cert_data, default_backend())
+        except ValueError:
+            # If DER loading fails, try PEM
+            cert = x509.load_pem_x509_certificate(cert_data, default_backend())
         
-        return cert.public_key()
+        return cert
 
 def getPKfromFile(public_key_path: str) -> types.PublicKeyTypes:
     """
@@ -81,5 +97,14 @@ def getPKfromFile(public_key_path: str) -> types.PublicKeyTypes:
         
         return public_key
     
+def computeDigest(data: bytes) -> str:
+    """
+    Computes the SHA256 digest of the given data.
 
+    - data: The input data for which the digest is to be computed.
 
+    Returns the SHA256 digest as a base64-encoded string.
+    """
+    digest = hashes.Hash(hashes.SHA256(), backend=default_backend())
+    digest.update(data)
+    return base64.b64encode(digest.finalize()).decode("ascii")

@@ -2,8 +2,11 @@ from hashlib import sha256
 import pyaadhaar
 import cv2
 import numpy as np
+from copy import deepcopy
+from lxml import etree
 from pyzbar.pyzbar import decode
 
+XMLDSIG_NS = "http://www.w3.org/2000/09/xmldsig#"
 
 def SHAGenerator(string, n):
     # This function is to generate the hash for given emailid and mobile
@@ -60,3 +63,32 @@ def Qr_img_to_text(file):
         decodeddata = i.data.decode('utf-8')
         totaldata.append(decodeddata)
     return totaldata
+
+
+# Utility functions for XML
+
+def get_verifiable_target(root) -> bytes:
+    """ This function returns the canonicalized bytes of the XML data.
+    ```
+        <OfflinePaperlessKyc>
+        <UidData> ... </UidData>
+        </OfflinePaperlessKyc>
+    ```
+    The <Signature> node gets removed from the XML data before canonicalization.
+    """
+
+    target = deepcopy(root)
+    
+    # removes the <Signature> node
+    target.remove(target.find(f".//{{{XMLDSIG_NS}}}Signature"))
+
+    return etree.tostring(
+        target,
+        method="c14n",
+        exclusive=True,
+        with_comments=False,
+    )
+
+
+def _clean_base64_text(text: str) -> str:
+    return "".join((text or "").replace("\\n", "").replace("\\r", "").replace("\\t", "").split())

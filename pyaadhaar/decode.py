@@ -3,6 +3,7 @@ from io import BytesIO
 from typing import Union
 from . import utils, verify
 import os, base64, zlib, zipfile
+from cryptography import x509
 
 from PIL import Image, ImageFile
 ImageFile.LOAD_TRUNCATED_IMAGES = True
@@ -210,16 +211,25 @@ class AadhaarSecureQr:
         image.save(filepath)
 
     # Verify the signature of the QR code
-    def verifySignature(self, cert_path: str) -> bool:
+    def verifySignature(self, cert: x509.Certificate | str) -> bool:
         """_Verify QR code signature_
 
         Args:
-            cert_path (str): _Path to the certificate file issued by UIDAI_
+            cert (x509.Certificate | str): _Certificate object or path to the certificate file issued by UIDAI_
 
         Returns:
             bool: _True if the signature is valid, False otherwise_
+
+        True return value means the data in the QR code was issued by the signing authority of the \
+        provided certificate and has not been tampered with since issuance.
         """
-        public_key = verify.getPKfromCert(cert_path)
+        if isinstance(cert, str):
+            cert = verify.getCertfromFile(cert)
+        else:
+            if not isinstance(cert, x509.Certificate):
+                raise TypeError("cert must be an x509.Certificate object or a path to a certificate file")
+        
+        public_key = cert.public_key()
         return verify.verifyBypk(self.signedData(), self.signature(), public_key)
 
     # Verify the email id
@@ -275,8 +285,8 @@ class AadhaarOfflineXML:
     # The special thing of Offline XML is that we can extract the high quality photo of user from the data
     # For more information check here : https://uidai.gov.in/en/ecosystem/authentication-devices-documents/about-aadhaar-paperless-offline-e-kyc.html
 
-    def __init__(self, file:str, passcode:str) -> None:
-        self.XMLDSIG_NS = "http://www.w3.org/2000/09/xmldsig#"
+    def __init__(self, file:str, passcode:str, strict: bool = False) -> None:
+        self.XMLDSIG_NS = utils.XMLDSIG_NS
         self.passcode = passcode
         self.data = {}
 
@@ -307,7 +317,8 @@ class AadhaarOfflineXML:
 
         # Parse the XML data
         try:
-            self.root = etree.fromstring(filedata)
+            parser = etree.XMLParser(remove_blank_text=True)
+            self.root = etree.fromstring(filedata, parser)
         except etree.XMLSyntaxError as e:
             raise ValueError("Invalid XML file") from e
         if self.root.tag != "OfflinePaperlessKyc":
@@ -317,7 +328,7 @@ class AadhaarOfflineXML:
         self.data = self._build_data(uid_data)
 
         # Run XML format validation and extract metadata
-        self._xml_format_validation()
+        self._xml_format_validation(strict)
 
     # Extract data from uid data within XML
     def _build_data(self, uid_data):
@@ -376,36 +387,71 @@ class AadhaarOfflineXML:
         if signed_info is None:
             raise ValueError("Invalid XML signature block")
         
+        references = signature_element.findall(f".//{{{self.XMLDSIG_NS}}}Reference")
+        if len(references) != 1:
+            raise ValueError("XML signature must contain exactly one Reference digest")
+        reference = references[0]
+        
+        digest_value_text = reference.findtext(f"{{{self.XMLDSIG_NS}}}DigestValue")
+
+        # Strict validation of XML format
         if strict:
             signature_method = signed_info.find(f"{{{self.XMLDSIG_NS}}}SignatureMethod")
             signature_algorithm = signature_method.get("Algorithm", "") if signature_method is not None else ""
-            if signature_algorithm != f"{{{self.XMLDSIG_NS}}}rsa-sha1":
+            if signature_algorithm != f"{self.XMLDSIG_NS}rsa-sha1":
                 raise ValueError(f"Unsupported XML signature algorithm: {signature_algorithm or 'undefined'}")
             
             canonicalization_method = signed_info.find(f"{{{self.XMLDSIG_NS}}}CanonicalizationMethod")
             canonicalization_algorithm = canonicalization_method.get("Algorithm", "") if canonicalization_method is not None else ""
             if canonicalization_algorithm != "http://www.w3.org/TR/2001/REC-xml-c14n-20010315":
                 raise ValueError(f"Unsupported XML canonicalization algorithm: {canonicalization_algorithm or 'undefined'}")
+            
+            digest_method = reference.find(f"{{{self.XMLDSIG_NS}}}DigestMethod")
+            if digest_method is None or not digest_value_text or not digest_method.get("Algorithm", "").lower().endswith("sha256"):
+                raise ValueError("XML signature has an invalid Reference digest")
+            
+            uri = reference.get("URI", "")
+            if uri not in ("", None):
+                raise ValueError(f"Unsupported XML signature Reference URI: {uri}")
+
+            transforms = reference.xpath(
+                "./ds:Transforms/ds:Transform/@Algorithm",
+                namespaces={"ds": self.XMLDSIG_NS},
+            )
+            if transforms != [f"{self.XMLDSIG_NS}enveloped-signature"]:
+                raise ValueError("Unsupported XML signature transform")
         
-        self.signature_value = signature_element.findtext(f"{{{self.XMLDSIG_NS}}}SignatureValue")
+        # Assigning all extracted metadata
+        self.signature_value = utils._clean_base64_text(
+            signature_element.findtext(f"{{{self.XMLDSIG_NS}}}SignatureValue")
+        )
         self.signed_data = etree.tostring(
             signed_info,
             method="c14n",
             exclusive=True,
             with_comments=False,
         )
+        self.digest_value = utils._clean_base64_text(digest_value_text)
 
     # Get decoded data in dictionary format
     def decodeddata(self) -> dict:
         return self.data
 
-    # Returns signature
+    # Returns b64 encoded signature
     def signature(self) -> str:
         return self.signature_value if self.signature_value else ""
     
     # Returns signed data
     def signedData(self) -> bytes:
         return self.signed_data if self.signed_data else b""
+
+    # Returns SHA256 digest value from XML
+    def digestValue(self) -> str:
+        return self.digest_value if self.digest_value else ""
+    
+    # Returns the embedded X.509 certificate from the XML
+    def x509Certificate(self):
+        return verify.extract_embedded_x509_certificate(self.root)
 
     # Check if mobile number is registered
     def isMobileNoRegistered(self) -> bool:
@@ -430,6 +476,73 @@ class AadhaarOfflineXML:
     # Save the image of user
     def saveimage(self, filepath:str) -> None:
         self.image().save(filepath)
+
+    # Verify the uid data against the digest value
+    def verifyDigest(self) -> bool:
+        target_data = utils.get_verifiable_target(self.root)
+        computed_digest = verify.computeDigest(target_data)
+        return computed_digest == self.digestValue()
+    
+    # Verify the signed data against the signature value using a trusted certificate
+    def verifySignature(self, cert: x509.Certificate | str) -> bool:
+        """_Verify XML signature_  
+
+        #### WARNING: This function only verifies the signature of the XML data, not the digest. \
+            Use verifyXML() instead to verify the integrity of the entire XML document.
+
+        Args:
+            cert (x509.Certificate | str): _The certificate (either as an x509.Certificate object \
+                                            or a path to a certificate file) issued by UIDAI_
+
+        Returns:
+            bool: _True if the signature is valid, False otherwise_
+        """
+        if isinstance(cert, str):
+            cert = verify.getCertfromFile(cert)
+        else:
+            if not isinstance(cert, x509.Certificate):
+                raise TypeError("cert must be an x509.Certificate object or a path to a certificate file")
+
+        public_key = cert.public_key()
+        return verify.verifyBypk(self.signedData(), 
+            base64.b64decode(self.signature()), 
+            public_key, hash=1
+        )
+    
+    def verifyXML(self, cert: x509.Certificate | str) -> bool:
+        """_Verify the integrity and authenticity of the entire XML document by \
+            validating both the digest and the signature._
+
+        Args:
+            cert (x509.Certificate | str): _The certificate (either as an x509.Certificate \
+                                            object or a path to a certificate file) issued by UIDAI_
+
+        Returns:
+            bool: _True if both the digest and signature are valid, False otherwise_
+
+        True return value means the data in the XML was issued by the signing authority of the provided certificate 
+        and has not been tampered with since issuance.
+        """
+        return self.verifyDigest() and self.verifySignature(cert)
+    
+    def verifyXMLembedded(self) -> bool:
+        """_Verify the integrity of XML document against the Certificate embedded in the XML_
+
+        #### WARNING: This function verifies the integrity of the XML data against the embedded certificate. \
+            Which cannot be trusted as a trust ancor unless the embedded certificate is verified against a trusted root certificate. \
+            Use verifyXML() instead to verify the integrity against a trusted certificate.
+
+        Raises:
+            ValueError: _No embedded X.509 certificate found in XML_
+
+        Returns:
+            bool: _True if the integrity is valid, False otherwise_
+        """
+        embedded_cert = self.x509Certificate()
+        if embedded_cert is None:
+            raise ValueError("No embedded X.509 certificate found in XML")
+        
+        return self.verifyXML(embedded_cert)
 
     # Verify the email id
     def verifyEmail(self, emailid:str) -> bool:
