@@ -2,7 +2,7 @@ from lxml import etree
 from io import BytesIO
 from typing import Union
 from . import utils, verify
-import os, base64, zlib, zipfile
+import os, base64, zlib
 from cryptography import x509
 
 from PIL import Image, ImageFile
@@ -285,35 +285,16 @@ class AadhaarOfflineXML:
     # The special thing of Offline XML is that we can extract the high quality photo of user from the data
     # For more information check here : https://uidai.gov.in/en/ecosystem/authentication-devices-documents/about-aadhaar-paperless-offline-e-kyc.html
 
-    def __init__(self, file:str, passcode:str, strict: bool = False) -> None:
+    def __init__(self, file: bytes | str, passcode: str, strict: bool = False) -> None:
         self.XMLDSIG_NS = utils.XMLDSIG_NS
-        self.passcode = passcode
         self.data = {}
 
-        # Extracting raw xml bytes from the file (supports both .xml and password-protected .zip containing .xml)
-        extension = os.path.splitext(file)[1].lower()
-        if ".zip" == extension:
-            # Need to pass the zip file and passcode/sharecode to this function
-            if not passcode:
-                raise ValueError("passcode is required when verifying a zipped offline XML")
-            try:
-                with zipfile.ZipFile(file, "r") as zf:
-                    xml_names = [name for name in zf.namelist() if name.lower().endswith(".xml")]
-                    if not xml_names:
-                        raise ValueError("ZIP archive does not contain an XML file")
-                    zf.setpassword(str(passcode).encode("utf-8"))
-                    filedata = zf.read(xml_names[0])
-            except RuntimeError as e:
-                raise ValueError("Could not open ZIP archive. The share code/passcode may be incorrect.") from e
-            except zipfile.BadZipFile as e:
-                raise ValueError("Unsupported or corrupted ZIP archive") from e
-            
-        elif ".xml" == extension:
-            with open(file, "rb") as f:
-                filedata = f.read()
-
-        else:
-            raise ValueError("Unsupported offline eKYC file type. Provide a .xml file or a password-protected .zip file.")
+        if not passcode:
+            raise ValueError("passcode is required when verifying a zipped offline XML")
+        self.passcode = passcode
+        
+        # Extracting raw xml bytes from the file
+        filedata = utils.getxmlbytes(file, passcode)
 
         # Parse the XML data
         try:

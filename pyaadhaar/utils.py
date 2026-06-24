@@ -1,6 +1,6 @@
 from hashlib import sha256
 import pyaadhaar
-import cv2
+import cv2, os, zipfile, io
 import numpy as np
 from copy import deepcopy
 from lxml import etree
@@ -67,6 +67,35 @@ def Qr_img_to_text(file):
 
 # Utility functions for XML
 
+def getxmlbytes(xml: bytes | str, passcode: str) -> bytes:
+    """ Extracting raw xml bytes from the file or zip archive (supports both .xml and password-protected .zip containing .xml)
+    """
+
+    if isinstance(xml, str):
+        if not os.path.isfile(xml):
+            raise FileNotFoundError(f"File not found: {xml}")
+        
+        extension = os.path.splitext(xml)[1].lower()
+        if ".zip" == extension:
+            # Need to pass the zip file and passcode/sharecode to this function
+            try:
+                return _getxmlbytes_from_zip(xml, passcode)
+            except RuntimeError as e:
+                raise ValueError("Could not open ZIP archive. The share code/passcode may be incorrect.") from e
+            except zipfile.BadZipFile as e:
+                raise ValueError("Unsupported or corrupted ZIP archive") from e
+
+        elif ".xml" == extension:
+            with open(xml, "rb") as f:
+                return f.read()
+    elif isinstance(xml, bytes):
+        try:
+            return _getxmlbytes_from_zip(io.BytesIO(xml), passcode)
+        except:
+            return xml
+    else:
+        raise ValueError("Unsupported offline eKYC file type. Provide a .xml file or a password-protected .zip file.")
+
 def get_verifiable_target(root) -> bytes:
     """ This function returns the canonicalized bytes of the XML data.
     ```
@@ -89,6 +118,14 @@ def get_verifiable_target(root) -> bytes:
         with_comments=False,
     )
 
+def _getxmlbytes_from_zip(zip: io.BytesIO | str, passcode: str) -> bytes:
+    """ Extracts the XML bytes from a password-protected ZIP archive. """
+    with zipfile.ZipFile(zip, "r") as zf:
+        xml_names = [name for name in zf.namelist() if name.lower().endswith(".xml")]
+        if not xml_names:
+            raise ValueError("ZIP archive does not contain an XML file")
+        zf.setpassword(str(passcode).encode("utf-8"))
+        return zf.read(xml_names[0])
 
 def _clean_base64_text(text: str) -> str:
     return "".join((text or "").replace("\\n", "").replace("\\r", "").replace("\\t", "").split())
